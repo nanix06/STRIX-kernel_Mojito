@@ -47,6 +47,29 @@ jobs:
           sed -i '/^orig_flow:$/a\\t\t;' fs/notify/fdinfo.c
           sed -i '0,/^static void susfs_run_sus_path_loop(void) {/s//void susfs_run_sus_path_loop(void) {/' fs/susfs.c
 
+      - name: Corriger l'injection initrc (hooks newfstat/fstat64 manquants)
+        run: |
+          # Patch fourni par le repo Patch_Ksu_SuSFS (clone dans patches/).
+          #
+          # Le patch kernelSU (nanix06) hooke newfstatat/fstatat64 -> ksu_handle_stat,
+          # mais oublie newfstat -> ksu_handle_newfstat_ret et fstat64 -> ksu_handle_fstat64_ret.
+          # Sans eux, init ne voit pas la taille reelle + accolee de init.rc, donc
+          # KERNEL_SU_RC / modules.rc ne sont jamais lus, ksud post-fs-data n'est jamais
+          # lance et les modules ne montent pas au boot.
+          FIX=patches/Patches/Fix/patch_ksu_initrc_newfstat.patch
+          test -f "$FIX" || {
+            echo "ERREUR: $FIX absent (repo Patch_Ksu_SuSFS incomplet)"
+            exit 1
+          }
+          # git apply (et non GNU patch) : le hunk fstat64 a 7 lignes de contexte avant
+          # et 2 apres, GNU patch le considere alors "ancre en fin de fichier" et le
+          # rejette ("Hunk #2 FAILED at 523"). git apply l'accepte avec le meme offset.
+          git apply --verbose "$FIX"
+
+          grep -q 'ksu_handle_newfstat_ret' fs/stat.c
+          grep -q 'ksu_handle_fstat64_ret' fs/stat.c
+          echo "OK: hooks newfstat/fstat64 presents dans fs/stat.c"   
+
       - name: Ajouter KernelSU-Next
         run: |
           git clone --depth=1 -b legacy https://github.com/KernelSU-Next/KernelSU-Next.git KernelSU
@@ -57,6 +80,7 @@ jobs:
           bash patches/Patches/Fix/fix_sepolicy_mojito.sh KernelSU
 
           printf '%s\n' \
+            '#define KSU_TYPE_VAL_TO_STRUCT' \
             '#include "ss/avtab.h"' \
             '#include "ss/constraint.h"' \
             '#include "ss/ebitmap.h"' \
@@ -75,6 +99,15 @@ jobs:
             '#include <linux/vmalloc.h>' \
             | cat - KernelSU/kernel/selinux/sepolicy.c > /tmp/sepolicy.c.net \
             && mv /tmp/sepolicy.c.net KernelSU/kernel/selinux/sepolicy.c
+
+          # KernelSU-Next legacy appelle ksu_policydb_fixup_len(), absent du sepolicy.c backslashxx
+          cat >> KernelSU/kernel/selinux/sepolicy.c <<'EOF'
+
+          int ksu_policydb_fixup_len(struct policydb *db, const char *tag)
+          {
+              return 0;
+          }
+          EOF
 
           cp patches/Patches/SuSFS_Ksu/susfs_patch_ksunext.patch KernelSU/
           cd KernelSU
