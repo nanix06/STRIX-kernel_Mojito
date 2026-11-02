@@ -1,4 +1,4 @@
-name: Mojito - STRIX-KsuNext-SUSFS
+name: STRIX-KsuNext-SUSFS-clang
 
 on:
   workflow_dispatch:
