@@ -1,0 +1,361 @@
+name: STRIX-KsuNext-SUSFS-clang
+
+on:
+  workflow_dispatch:
+    inputs:
+      clang_version:
+        description: "Version de clang/LLVM (ex: 21, 22, 23)"
+        required: true
+        default: "23"
+      boot_url:
+        description: "URL du boot.img a patcher (vide = pas de boot.img, seulement Image*)"
+        required: false
+        default: "https://download.pixelos.net/seventeen/sunny/recovery/boot-sunny_20261028_0537.img"
+
+permissions:
+  contents: read
+
+env:
+  ARCH: arm64
+  SUBARCH: arm64
+  DEFCONFIG: vendor/mojito_defconfig
+  CROSS_COMPILE: aarch64-linux-gnu-
+  CROSS_COMPILE_COMPAT: arm-linux-gnueabi-
+  CLANG_VER: ${{ inputs.clang_version || '23' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Télécharger le source
+        uses: actions/checkout@v4
+        with:
+          ref: inline-rom
+          fetch-depth: 1
+          submodules: recursive
+
+      - name: Télécharger le boot.img
+        if: ${{ inputs.boot_url != '' }}
+        env:
+          BOOT_URL: ${{ inputs.boot_url }}
+        run: |
+          # Téléchargé AVANT le build : une URL morte échoue en 10 s au lieu de
+          # 40 min de compilation.
+          curl -fL --retry 3 --retry-delay 2 -o stock-boot.img "$BOOT_URL"
+          echo "taille    : $(stat -c%s stock-boot.img) octets"
+          test "$(head -c8 stock-boot.img)" = "ANDROID!" || { echo "ERREUR: pas un boot.img (magic ANDROID! absent)"; exit 1; }
+          echo "magic     : ANDROID!"
+
+      - name: Installer les dépendances
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison build-essential ccache flex git libssl-dev \
+            libelf-dev pahole python3 rsync unzip wget zip \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            gcc-arm-linux-gnueabi binutils-arm-linux-gnueabi \
+            lsb-release software-properties-common gnupg
+
+      - name: Installer clang (apt.llvm.org)
+        run: |
+          wget -q https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh "$CLANG_VER" all
+          sudo apt-get install -y "lld-$CLANG_VER" "llvm-$CLANG_VER"
+
+          # Liens sans suffixe : le Makefile du kernel (LLVM=1) appelle "clang", "llvm-ar", etc. en dur
+          for t in clang clang++ clang-cpp ld.lld lld llvm-ar llvm-nm llvm-objcopy \
+                   llvm-objdump llvm-readelf llvm-strip llvm-ranlib llvm-as llvm-size; do
+            [ -x "/usr/lib/llvm-$CLANG_VER/bin/$t" ] && \
+              sudo ln -sf "/usr/lib/llvm-$CLANG_VER/bin/$t" "/usr/local/bin/$t"
+          done
+          clang --version
+          ld.lld --version
+          llvm-ar --version | head -n1
+          
+      - name: Télécharger et appliquer les patchs KernelSU et SuSFS
+        run: |
+          git clone --depth=1 -b main https://github.com/nanix06/Patch_Ksu_SuSFS.git patches
+          patch -p1 --fuzz=3 < patches/Patches/SU_kernel/patch_ksunext.patch || true
+          patch -p1 --fuzz=3 < patches/Patches/SuSFS_Kernel/50_add_susfs_in_kernel-4.14.patch || true
+          patch -p1 --fuzz=3 < patches/Patches/Fix/susfs_fix_statc.patch || true
+          patch -p1 --fuzz=3 < patches/Patches/SuSFS_Kernel/55_try_umount_for_susfs.patch || true
+          patch -p1 --fuzz=3 < patches/Patches/SU_kernel/patch_ksu_path_umount.patch || true
+          sed -i 's/inotify_mark_user_mask(mark)/(mark->mask \& IN_ALL_EVENTS)/g' fs/notify/fdinfo.c
+          sed -i '/^orig_flow:$/a\\t\t;' fs/notify/fdinfo.c
+          sed -i '0,/^static void susfs_run_sus_path_loop(void) {/s//void susfs_run_sus_path_loop(void) {/' fs/susfs.c
+
+      - name: Corriger l'injection initrc (hooks newfstat/fstat64 manquants)
+        run: |
+          # Patch fourni par le repo Patch_Ksu_SuSFS (clone dans patches/).
+          #
+          # Le patch kernelSU (nanix06) hooke newfstatat/fstatat64 -> ksu_handle_stat,
+          # mais oublie newfstat -> ksu_handle_newfstat_ret et fstat64 -> ksu_handle_fstat64_ret.
+          # Sans eux, init ne voit pas la taille reelle + accolee de init.rc, donc
+          # KERNEL_SU_RC / modules.rc ne sont jamais lus, ksud post-fs-data n'est jamais
+          # lance et les modules ne montent pas au boot.
+          FIX=patches/Patches/Fix/patch_ksu_initrc_newfstat.patch
+          test -f "$FIX" || {
+            echo "ERREUR: $FIX absent (repo Patch_Ksu_SuSFS incomplet)"
+            exit 1
+          }
+          # git apply (et non GNU patch) : le hunk fstat64 a 7 lignes de contexte avant
+          # et 2 apres, GNU patch le considere alors "ancre en fin de fichier" et le
+          # rejette ("Hunk #2 FAILED at 523"). git apply l'accepte avec le meme offset.
+          git apply --verbose "$FIX"
+
+          grep -q 'ksu_handle_newfstat_ret' fs/stat.c
+          grep -q 'ksu_handle_fstat64_ret' fs/stat.c
+          echo "OK: hooks newfstat/fstat64 presents dans fs/stat.c"   
+
+      - name: Ajouter KernelSU-Next
+        run: |
+          git clone --depth=1 -b legacy https://github.com/KernelSU-Next/KernelSU-Next.git KernelSU
+          ln -s ../KernelSU/kernel drivers/kernelsu
+          sed -i 's/get_monotonic_boottime(&ts)/get_monotonic_boottime64(\&ts)/' KernelSU/kernel/sulog/event.c
+          sed -i '/#include <linux\/uaccess.h>/a #include <linux/timekeeping.h>' KernelSU/kernel/sulog/event.c
+
+          bash patches/Patches/Fix/fix_sepolicy_mojito.sh KernelSU
+
+          # NB: pas de '#define KSU_TYPE_VAL_TO_STRUCT' ici. Ce noyau 4.14 utilise encore
+          # flex_array dans policydb/avtab (type_val_to_struct_array, type_attr_map_array,
+          # sym_val_to_name, htable). Ce define forcerait le chemin "noyau recent" de
+          # sepolicy.c et casserait la compilation (14 erreurs).
+          printf '%s\n' \
+            '#include "ss/avtab.h"' \
+            '#include "ss/constraint.h"' \
+            '#include "ss/ebitmap.h"' \
+            '#include "ss/hashtab.h"' \
+            '#include "ss/policydb.h"' \
+            '#include "ss/services.h"' \
+            '#include "ss/symtab.h"' \
+            '#include <linux/gfp.h>' \
+            '#include <linux/kernel.h>' \
+            '#include <linux/printk.h>' \
+            '#include <linux/slab.h>' \
+            '#include <linux/stddef.h>' \
+            '#include <linux/string.h>' \
+            '#include <linux/types.h>' \
+            '#include <linux/version.h>' \
+            '#include <linux/vmalloc.h>' \
+            | cat - KernelSU/kernel/selinux/sepolicy.c > /tmp/sepolicy.c.net \
+            && mv /tmp/sepolicy.c.net KernelSU/kernel/selinux/sepolicy.c
+
+          # KernelSU-Next legacy appelle ksu_policydb_fixup_len(), absent du sepolicy.c backslashxx
+          cat >> KernelSU/kernel/selinux/sepolicy.c <<'EOF'
+
+          int ksu_policydb_fixup_len(struct policydb *db, const char *tag)
+          {
+              return 0;
+          }
+          EOF
+
+          cp patches/Patches/SuSFS_Ksu/susfs_patch_ksunext.patch KernelSU/
+          cd KernelSU
+          patch -p1 < susfs_patch_ksunext.patch || true
+          cd ..
+
+      - name: Configurer le noyau
+        run: |
+          export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
+
+          mkdir -p out
+
+          make O=out ARCH=arm64 \
+            CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE="$CROSS_COMPILE" \
+            CROSS_COMPILE_COMPAT="$CROSS_COMPILE_COMPAT" \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            "$DEFCONFIG"
+
+          # KernelSU
+          ./scripts/config --file out/.config --enable KSU
+          ./scripts/config --file out/.config --disable KSU_KPROBES_KSUD
+          ./scripts/config --file out/.config --enable CONFIG_KALLSYMS_ALL
+
+          # SUSFS
+          ./scripts/config --file out/.config --enable KSU_SUSFS
+          ./scripts/config --file out/.config --enable KSU_SUSFS_HAS_MAGIC_MOUNT
+          ./scripts/config --file out/.config --enable KSU_SUSFS_SUS_PATH
+          ./scripts/config --file out/.config --disable KSU_SUSFS_SUS_MOUNT
+          ./scripts/config --file out/.config --enable KSU_SUSFS_SUS_KSTAT
+          ./scripts/config --file out/.config --enable KSU_SUSFS_SUS_OVERLAYFS
+          ./scripts/config --file out/.config --enable KSU_SUSFS_TRY_UMOUNT
+          ./scripts/config --file out/.config --enable KSU_SUSFS_SPOOF_UNAME_RELEASE
+
+          ./scripts/config --file out/.config \
+            --set-str LOCALVERSION "-STRIX"
+          ./scripts/config --file out/.config --disable CONFIG_LOCALVERSION_AUTO
+
+          make O=out ARCH=arm64 \
+            CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE="$CROSS_COMPILE" \
+            CROSS_COMPILE_COMPAT="$CROSS_COMPILE_COMPAT" \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            olddefconfig
+            
+      - name: Compiler le noyau
+        run: |
+          make -j"$(nproc)" O=out ARCH=arm64 \
+            CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE="$CROSS_COMPILE" \
+            CROSS_COMPILE_COMPAT="$CROSS_COMPILE_COMPAT" \
+            LLVM=1 \
+            LLVM_IAS=1
+
+      - name: Préparer les fichiers
+        run: |
+          mkdir -p release
+          cp out/arch/arm64/boot/Image.gz release/ 2>/dev/null || true
+          cp out/arch/arm64/boot/Image.gz-dtb release/ 2>/dev/null || true
+          cp out/arch/arm64/boot/Image release/ 2>/dev/null || true
+          sha256sum release/* > release/SHA256SUMS
+
+      - name: Générer le boot.img patché
+        if: ${{ inputs.boot_url != '' }}
+        env:
+          BOOT_URL: ${{ inputs.boot_url }}
+        run: |
+          grep -aq 'KernelSU' out/arch/arm64/boot/Image || { echo "ERREUR: KernelSU absent du noyau compile"; exit 1; }
+
+          BOOT_OUT=release/boot-mojito-KSU-STRIX.img
+
+          # Repack du boot de la ROM : on garde header, ramdisk, cmdline, os_version
+          # (et dtb / recovery_dtbo / second pour les headers v0-v2) ; on ne
+          # remplace QUE la section kernel. Le format injecte (Image, Image.gz ou
+          # Image.gz-dtb) est choisi d'apres celui du noyau du boot stock.
+          python3 - stock-boot.img out/arch/arm64/boot "$BOOT_OUT" <<'PY'
+          import hashlib, os, struct, sys
+
+          stock, bdir, dst = sys.argv[1], sys.argv[2], sys.argv[3]
+          DTB_MAGIC = b"\xd0\x0d\xfe\xed"
+
+          img = open(stock, "rb").read()
+          if img[:8] != b"ANDROID!":
+              sys.exit("boot stock: magic ANDROID! absent")
+
+          hv = struct.unpack_from("<I", img, 40)[0]
+          if hv > 4:
+              sys.exit("header_version %d non gere (attendu 0 a 4)" % hv)
+
+          def u32(o):
+              return struct.unpack_from("<I", img, o)[0]
+
+          if hv >= 3:
+              PAGE = 4096
+              ks, rs = u32(8), u32(12)
+              parts = [("ramdisk", rs)]
+          else:
+              PAGE = u32(36)
+              ks, rs, ss = u32(8), u32(16), u32(24)
+              parts = [("ramdisk", rs), ("second", ss)]
+              if hv >= 1:
+                  parts.append(("recovery_dtbo", u32(1632)))
+              if hv >= 2:
+                  parts.append(("dtb", u32(1648)))
+
+          def align(n):
+              return (n + PAGE - 1) // PAGE * PAGE
+
+          # decoupe des sections du boot stock (toutes sauf le noyau sont conservees)
+          off = PAGE
+          stock_kernel = img[off:off + ks]
+          off += align(ks)
+          sections = {}
+          for name, size in parts:
+              sections[name] = img[off:off + size]
+              if len(sections[name]) != size:
+                  sys.exit("section %s hors image: header incoherent" % name)
+              off += align(size)
+
+          # choix du noyau a injecter selon le format du noyau stock
+          gz = stock_kernel[:2] == b"\x1f\x8b"
+          app_dtb = DTB_MAGIC in stock_kernel
+          has_dtb_sec = len(sections.get("dtb", b"")) > 0
+          if gz and app_dtb:
+              cand = "Image.gz-dtb"
+          elif gz:
+              cand = "Image.gz"
+          elif app_dtb:
+              sys.exit("noyau stock = Image brute + dtb colle: format non gere")
+          else:
+              cand = "Image"
+          if cand == "Image.gz-dtb" and not os.path.exists(os.path.join(bdir, cand)):
+              sys.exit("le stock attend Image.gz-dtb mais la compilation ne l'a pas produit")
+          kpath = os.path.join(bdir, cand)
+          kern = open(kpath, "rb").read()
+          raw = open(os.path.join(bdir, "Image"), "rb").read()
+          if raw[0x38:0x3C] != b"ARM\x64":
+              sys.exit("le noyau compile n'est pas une Image arm64")
+          print("header   : v%d  page=%d" % (hv, PAGE))
+          print("stock    : noyau %d o (%s%s)  dtb section=%s" % (
+              ks, "gzip" if gz else "brut", "+dtb colle" if app_dtb else "", has_dtb_sec))
+          print("injecte  : %s (%d o)" % (cand, len(kern)))
+
+          hdr = bytearray(img[:PAGE])
+          struct.pack_into("<I", hdr, 8, len(kern))
+          body = bytes(kern) + b"\0" * (align(len(kern)) - len(kern))
+          for name, _ in parts:
+              d = sections[name]
+              body += d + b"\0" * (align(len(d)) - len(d))
+          if hv == 4:
+              struct.pack_into("<I", hdr, 1580, 0)  # signature_size = 0
+          if hv < 3:
+              # champ id : SHA1 comme mkbootimg
+              h = hashlib.sha1()
+              for blob in [kern] + [sections[n] for n, _ in parts]:
+                  h.update(blob)
+                  h.update(struct.pack("<I", len(blob)))
+              hdr[576:608] = h.digest().ljust(32, b"\0")
+
+          out = bytes(hdr) + body
+          open(dst, "wb").write(out)
+
+          # relecture : rien ne doit avoir bouge a part le noyau
+          chk = open(dst, "rb").read()
+          assert chk[:8] == b"ANDROID!" and len(chk) % PAGE == 0
+          nks = struct.unpack_from("<I", chk, 8)[0]
+          assert chk[PAGE:PAGE + nks] == kern
+          o = PAGE + align(nks)
+          for name, size in parts:
+              assert chk[o:o + size] == sections[name], name
+              o += align(size)
+          assert chk[40:44] == img[40:44]
+          if hv >= 3:
+              assert chk[16:20] == img[16:20] and chk[44:1580] == img[44:1580]
+          else:
+              assert chk[44:576] == img[44:576] and chk[608:1632] == img[608:1632]
+          print("image    : %d o (%.2f MiB)" % (len(chk), len(chk) / 1048576.0))
+          print("sha256   : " + hashlib.sha256(chk).hexdigest())
+          print("OK: ramdisk / cmdline / os_version / dtb identiques au stock")
+          if img[-64:-60] == b"AVBf":
+              print("NOTE: le boot stock a un footer AVB (perdu au repack) -> flasher vbmeta avec --disable-verity --disable-verification")
+          PY
+
+          cd release
+          sha256sum $(ls -1 | grep -v '^SHA256SUMS$') > SHA256SUMS
+          cat SHA256SUMS
+
+          {
+            echo "### boot.img patché"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| ROM source | $BOOT_URL |"
+            echo "| fichier | \`boot-mojito-KSU-STRIX.img\` |"
+            echo "| taille | $(stat -c%s boot-mojito-KSU-STRIX.img) octets |"
+            echo "| sha256 | \`$(sha256sum boot-mojito-KSU-STRIX.img | cut -d' ' -f1)\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Envoyer l’artefact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Mojito-STRIX-KernelSU
+          path: release/
+          if-no-files-found: error
