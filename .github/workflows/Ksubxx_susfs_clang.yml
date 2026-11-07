@@ -126,6 +126,25 @@ jobs:
           make O=out ARCH=arm64 \
             $MAKE_ARGS \
             olddefconfig
+
+      - name: Ajouter Re:Kernel
+        run: |
+          # 1. Patch : fichiers du driver (drivers/net/rekernel + include/net)
+          #    et hooks binder / binder_alloc / signal.
+          patch -p1 < "patches/Patches/Re:Kernel/rekernel_extra.patch"
+
+          # 2. Integration kbuild (source Kconfig + obj-y), idempotente.
+          bash "patches/Patches/Re:Kernel/rekernel_patches.sh"
+
+          # 3. Verifications : le build doit s'arreter ici si l'integration
+          #    a rate, plutot que de produire un kernel sans Re:Kernel.
+          test -f drivers/net/rekernel/rekernel.c
+          test -f include/net/rekernel.h
+          grep -Fq 'drivers/net/rekernel/Kconfig' drivers/net/Kconfig
+          grep -Fq 'obj-$(CONFIG_REKERNEL) += rekernel/' drivers/net/Makefile
+          grep -Fq 'CONFIG_REKERNEL' drivers/android/binder.c
+          grep -Fq 'CONFIG_REKERNEL' drivers/android/binder_alloc.c
+          grep -Fq 'CONFIG_REKERNEL' kernel/signal.c
             
       - name: Compiler le noyau
         run: |
