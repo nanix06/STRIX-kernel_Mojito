@@ -35,8 +35,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            bc bison build-essential ccache flex git libssl-dev \
-            libelf-dev pahole python3 rsync unzip wget zip \
+            bc bison build-essential ccache coccinelle flex git libssl-dev \
+            libelf-dev pahole patch python3 rsync unzip wget zip \
             gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
             gcc-arm-linux-gnueabi binutils-arm-linux-gnueabi \
             lsb-release software-properties-common gnupg
@@ -159,6 +159,35 @@ jobs:
           grep -Fq 'CONFIG_REKERNEL' drivers/android/binder_alloc.c
           grep -Fq 'CONFIG_REKERNEL' kernel/signal.c
 
+      - name: Ajouter DroidSpaces (patchs noyau)
+        run: |
+          # Les correctifs (et leurs sources Coccinelle) vivent dans
+          # Patch_Ksu_SuSFS/Patches/Droidspaces, clone plus haut dans patches/.
+          DS=patches/Patches/Droidspaces
+          test -f "$DS/apply_droidspaces.sh" || {
+            echo "ERREUR: $DS/apply_droidspaces.sh absent (repo Patch_Ksu_SuSFS incomplet)" >&2
+            exit 1
+          }
+
+          # Le depot de patchs peut etre pousse depuis Windows (CRLF) : sans
+          # cela, bash lirait "set -uo pipefail\r" et refuserait de demarrer.
+          find "$DS" -maxdepth 1 -type f -exec sed -i 's/\r$//' {} +
+
+          bash "$DS/apply_droidspaces.sh"
+
+          # Le script doit avoir pose le code (ou avoir constate qu'il etait deja la).
+          grep -qF 'kernfs_create_link(cgrp->kn, name, kn)' kernel/cgroup/cgroup.c
+
+          if [ -f net/netfilter/xt_qtaguid.c ]; then
+            if grep -qF 'dev_get_stats(iface_entry->net_dev' net/netfilter/xt_qtaguid.c; then
+              echo "ERREUR: correctif xt_qtaguid non applique" >&2
+              exit 1
+            fi
+          else
+            echo "OK: xt_qtaguid absent de cet arbre, correctif non requis"
+          fi
+          echo "OK: correctifs noyau DroidSpaces appliques"
+
       - name: Configurer le noyau
         run: |
           export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
@@ -193,6 +222,33 @@ jobs:
             --set-str LOCALVERSION "-STRIX"
           ./scripts/config --file out/.config --disable CONFIG_LOCALVERSION_AUTO
 
+          # DroidSpaces : fragment d'options. scripts/config accepte aussi les
+          # symboles absents (il ajoute la ligne) ; olddefconfig les supprime
+          # ensuite proprement. La verification ci-dessous porte sur les
+          # options qui doivent reellement etre actives sur ce noyau.
+          DS=patches/Patches/Droidspaces
+          test -f "$DS/droidspaces.config" || {
+            echo "ERREUR: $DS/droidspaces.config absent" >&2
+            exit 1
+          }
+          while IFS='=' read -r sym val; do
+            sym="${sym%$'\r'}"
+            val="${val%$'\r'}"
+            case "$sym" in
+              CONFIG_*) ;;
+              *) continue ;;
+            esac
+            case "$val" in
+              y) ./scripts/config --file out/.config --enable  "${sym#CONFIG_}" ;;
+              n) ./scripts/config --file out/.config --disable "${sym#CONFIG_}" ;;
+              m) ./scripts/config --file out/.config --module  "${sym#CONFIG_}" ;;
+              *)
+                echo "ERREUR: valeur inattendue dans droidspaces.config: $sym=$val" >&2
+                exit 1
+                ;;
+            esac
+          done < "$DS/droidspaces.config"
+
           make O=out ARCH=arm64 \
             CC=clang \
             CLANG_TRIPLE=aarch64-linux-gnu- \
@@ -201,7 +257,37 @@ jobs:
             LLVM=1 \
             LLVM_IAS=1 \
             olddefconfig
-            
+
+          # Controle final : les options indispensables a DroidSpaces doivent
+          # etre =y. On echoue ici plutot que de livrer un noyau ou les
+          # conteneurs ne demarreraient pas.
+          for opt in \
+            CONFIG_NAMESPACES CONFIG_PID_NS CONFIG_UTS_NS CONFIG_IPC_NS \
+            CONFIG_SECCOMP CONFIG_SECCOMP_FILTER \
+            CONFIG_SYSVIPC CONFIG_POSIX_MQUEUE CONFIG_USER_NS \
+            CONFIG_CGROUPS CONFIG_CGROUP_DEVICE CONFIG_CGROUP_SCHED \
+            CONFIG_FAIR_GROUP_SCHED CONFIG_CGROUP_FREEZER CONFIG_CGROUP_NET_PRIO \
+            CONFIG_MEMCG CONFIG_MEMCG_SWAP CONFIG_CFS_BANDWIDTH \
+            CONFIG_CGROUP_PIDS CONFIG_CGROUP_CPUACCT \
+            CONFIG_DEVTMPFS CONFIG_OVERLAY_FS CONFIG_TMPFS_XATTR \
+            CONFIG_TMPFS_POSIX_ACL \
+            CONFIG_NET_NS CONFIG_VETH CONFIG_BRIDGE CONFIG_NETFILTER \
+            CONFIG_BRIDGE_NETFILTER CONFIG_NETFILTER_ADVANCED \
+            CONFIG_NF_CONNTRACK CONFIG_IP_NF_IPTABLES CONFIG_IP_NF_FILTER \
+            CONFIG_NF_NAT CONFIG_NF_TABLES CONFIG_IP_NF_NAT \
+            CONFIG_IP_NF_TARGET_MASQUERADE CONFIG_NF_NAT_REDIRECT \
+            CONFIG_IP_ADVANCED_ROUTER CONFIG_IP_MULTIPLE_TABLES \
+            CONFIG_IPV6 CONFIG_IPV6_MULTIPLE_TABLES \
+            CONFIG_IP6_NF_IPTABLES CONFIG_IP6_NF_FILTER CONFIG_IP6_NF_MANGLE \
+            CONFIG_IP6_NF_NAT CONFIG_IP6_NF_TARGET_MASQUERADE CONFIG_MACVLAN
+          do
+            grep -q "^$opt=y$" out/.config || {
+              echo "ERREUR: $opt n'est pas actif dans out/.config" >&2
+              exit 1
+            }
+          done
+          echo "OK: options noyau DroidSpaces actives"
+
       - name: Compiler le noyau
         run: |
           make -j"$(nproc)" O=out ARCH=arm64 \
