@@ -144,7 +144,18 @@ jobs:
         run: |
           # 1. Patch : fichiers du driver (drivers/net/rekernel + include/net)
           #    et hooks binder / binder_alloc / signal.
-          patch -p1 < "patches/Patches/Re:Kernel/rekernel_extra.patch"
+          #
+          # git apply (et non GNU patch) : les hunks d'includes de
+          # drivers/android/binder.c et binder_alloc.c sont rejetes par
+          # GNU patch ("Hunk #1 FAILED at 71") alors que le contexte
+          # correspond exactement a l'arbre. git apply les accepte, comme
+          # pour le patch initrc plus haut.
+          RK=patches/Patches/Re:Kernel/rekernel_extra.patch
+          test -f "$RK" || {
+            echo "ERREUR: $RK absent (repo Patch_Ksu_SuSFS incomplet)" >&2
+            exit 1
+          }
+          git apply --verbose "$RK"
 
           # 2. Integration kbuild (source Kconfig + obj-y), idempotente.
           bash "patches/Patches/Re:Kernel/rekernel_patches.sh"
