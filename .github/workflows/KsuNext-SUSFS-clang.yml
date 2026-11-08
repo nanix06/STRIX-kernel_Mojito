@@ -140,64 +140,21 @@ jobs:
           patch -p1 < susfs_patch_ksunext.patch || true
           cd ..
 
-      - name: Ajouter Re:Kernel
-        run: |
-          # 1. Patch : fichiers du driver (drivers/net/rekernel + include/net)
-          #    et hooks binder / binder_alloc / signal.
-          #
-          # git apply (et non GNU patch) : les hunks d'includes de
-          # drivers/android/binder.c et binder_alloc.c sont rejetes par
-          # GNU patch ("Hunk #1 FAILED at 71") alors que le contexte
-          # correspond exactement a l'arbre. git apply les accepte, comme
-          # pour le patch initrc plus haut.
-          RK=patches/Patches/Re:Kernel/rekernel_extra.patch
-          test -f "$RK" || {
-            echo "ERREUR: $RK absent (repo Patch_Ksu_SuSFS incomplet)" >&2
+      - name: Appliquer le commit mojito_defconfig (localversion STRIX-HOPE)
+        run: |  
+          DEF="arch/arm64/configs/$DEFCONFIG"
+          test -f "$DEF" || {
+            echo "ERREUR: $DEF introuvable" >&2
             exit 1
           }
-          git apply --verbose "$RK"
-
-          # 2. Integration kbuild (source Kconfig + obj-y), idempotente.
-          bash "patches/Patches/Re:Kernel/rekernel_patches.sh"
-
-          # 3. Verifications : le build doit s'arreter ici si l'integration
-          #    a rate, plutot que de produire un kernel sans Re:Kernel.
-          test -f drivers/net/rekernel/rekernel.c
-          test -f include/net/rekernel.h
-          grep -Fq 'drivers/net/rekernel/Kconfig' drivers/net/Kconfig
-          grep -Fq 'obj-$(CONFIG_REKERNEL) += rekernel/' drivers/net/Makefile
-          grep -Fq 'CONFIG_REKERNEL' drivers/android/binder.c
-          grep -Fq 'CONFIG_REKERNEL' drivers/android/binder_alloc.c
-          grep -Fq 'CONFIG_REKERNEL' kernel/signal.c
-
-      - name: Ajouter DroidSpaces (patchs noyau)
-        run: |
-          # Les correctifs (et leurs sources Coccinelle) vivent dans
-          # Patch_Ksu_SuSFS/Patches/Droidspaces, clone plus haut dans patches/.
-          DS=patches/Patches/Droidspaces
-          test -f "$DS/apply_droidspaces.sh" || {
-            echo "ERREUR: $DS/apply_droidspaces.sh absent (repo Patch_Ksu_SuSFS incomplet)" >&2
-            exit 1
-          }
-
-          # Le depot de patchs peut etre pousse depuis Windows (CRLF) : sans
-          # cela, bash lirait "set -uo pipefail\r" et refuserait de demarrer.
-          find "$DS" -maxdepth 1 -type f -exec sed -i 's/\r$//' {} +
-
-          bash "$DS/apply_droidspaces.sh"
-
-          # Le script doit avoir pose le code (ou avoir constate qu'il etait deja la).
-          grep -qF 'kernfs_create_link(cgrp->kn, name, kn)' kernel/cgroup/cgroup.c
-
-          if [ -f net/netfilter/xt_qtaguid.c ]; then
-            if grep -qF 'dev_get_stats(iface_entry->net_dev' net/netfilter/xt_qtaguid.c; then
-              echo "ERREUR: correctif xt_qtaguid non applique" >&2
-              exit 1
-            fi
+          if grep -q '^CONFIG_LOCALVERSION=' "$DEF"; then
+          sed -i 's/^CONFIG_LOCALVERSION=.*/CONFIG_LOCALVERSION="-STRIX-HOPE"/' "$DEF"
           else
-            echo "OK: xt_qtaguid absent de cet arbre, correctif non requis"
+            sed -i '/^# CONFIG_LOCALVERSION is not set$/d' "$DEF"
+            printf '\nCONFIG_LOCALVERSION="-STRIX-HOPE"\n' >> "$DEF"
           fi
-          echo "OK: correctifs noyau DroidSpaces appliques"
+          grep -q '^CONFIG_LOCALVERSION="-STRIX-HOPE"$' "$DEF"
+          echo "OK: localversion STRIX-HOPE applique dans $DEF"
 
       - name: Configurer le noyau
         run: |
@@ -230,35 +187,8 @@ jobs:
           ./scripts/config --file out/.config --enable KSU_SUSFS_SPOOF_UNAME_RELEASE
 
           ./scripts/config --file out/.config \
-            --set-str LOCALVERSION "-STRIX"
+            --set-str LOCALVERSION "-STRIX-HOPE"
           ./scripts/config --file out/.config --disable CONFIG_LOCALVERSION_AUTO
-
-          # DroidSpaces : fragment d'options. scripts/config accepte aussi les
-          # symboles absents (il ajoute la ligne) ; olddefconfig les supprime
-          # ensuite proprement. La verification ci-dessous porte sur les
-          # options qui doivent reellement etre actives sur ce noyau.
-          DS=patches/Patches/Droidspaces
-          test -f "$DS/droidspaces.config" || {
-            echo "ERREUR: $DS/droidspaces.config absent" >&2
-            exit 1
-          }
-          while IFS='=' read -r sym val; do
-            sym="${sym%$'\r'}"
-            val="${val%$'\r'}"
-            case "$sym" in
-              CONFIG_*) ;;
-              *) continue ;;
-            esac
-            case "$val" in
-              y) ./scripts/config --file out/.config --enable  "${sym#CONFIG_}" ;;
-              n) ./scripts/config --file out/.config --disable "${sym#CONFIG_}" ;;
-              m) ./scripts/config --file out/.config --module  "${sym#CONFIG_}" ;;
-              *)
-                echo "ERREUR: valeur inattendue dans droidspaces.config: $sym=$val" >&2
-                exit 1
-                ;;
-            esac
-          done < "$DS/droidspaces.config"
 
           make O=out ARCH=arm64 \
             CC=clang \
@@ -268,36 +198,6 @@ jobs:
             LLVM=1 \
             LLVM_IAS=1 \
             olddefconfig
-
-          # Controle final : les options indispensables a DroidSpaces doivent
-          # etre =y. On echoue ici plutot que de livrer un noyau ou les
-          # conteneurs ne demarreraient pas.
-          for opt in \
-            CONFIG_NAMESPACES CONFIG_PID_NS CONFIG_UTS_NS CONFIG_IPC_NS \
-            CONFIG_SECCOMP CONFIG_SECCOMP_FILTER \
-            CONFIG_SYSVIPC CONFIG_POSIX_MQUEUE CONFIG_USER_NS \
-            CONFIG_CGROUPS CONFIG_CGROUP_DEVICE CONFIG_CGROUP_SCHED \
-            CONFIG_FAIR_GROUP_SCHED CONFIG_CGROUP_FREEZER CONFIG_CGROUP_NET_PRIO \
-            CONFIG_MEMCG CONFIG_MEMCG_SWAP CONFIG_CFS_BANDWIDTH \
-            CONFIG_CGROUP_PIDS CONFIG_CGROUP_CPUACCT \
-            CONFIG_DEVTMPFS CONFIG_OVERLAY_FS CONFIG_TMPFS_XATTR \
-            CONFIG_TMPFS_POSIX_ACL \
-            CONFIG_NET_NS CONFIG_VETH CONFIG_BRIDGE CONFIG_NETFILTER \
-            CONFIG_BRIDGE_NETFILTER CONFIG_NETFILTER_ADVANCED \
-            CONFIG_NF_CONNTRACK CONFIG_IP_NF_IPTABLES CONFIG_IP_NF_FILTER \
-            CONFIG_NF_NAT CONFIG_NF_TABLES CONFIG_IP_NF_NAT \
-            CONFIG_IP_NF_TARGET_MASQUERADE CONFIG_NF_NAT_REDIRECT \
-            CONFIG_IP_ADVANCED_ROUTER CONFIG_IP_MULTIPLE_TABLES \
-            CONFIG_IPV6 CONFIG_IPV6_MULTIPLE_TABLES \
-            CONFIG_IP6_NF_IPTABLES CONFIG_IP6_NF_FILTER CONFIG_IP6_NF_MANGLE \
-            CONFIG_IP6_NF_NAT CONFIG_IP6_NF_TARGET_MASQUERADE CONFIG_MACVLAN
-          do
-            grep -q "^$opt=y$" out/.config || {
-              echo "ERREUR: $opt n'est pas actif dans out/.config" >&2
-              exit 1
-            }
-          done
-          echo "OK: options noyau DroidSpaces actives"
 
       - name: Compiler le noyau
         run: |
