@@ -1,4 +1,4 @@
-name: Mojito - STRIX-KernelSu21
+name: STRIX-bxx-KernelSu-clang
 
 on:
   workflow_dispatch:
