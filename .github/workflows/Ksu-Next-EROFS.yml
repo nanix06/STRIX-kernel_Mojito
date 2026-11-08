@@ -1,0 +1,562 @@
+name: STRIX-KsuNext-SUSFS-EROFS
+
+on:
+  workflow_dispatch:
+    inputs:
+      clang_version:
+        description: "ZyC Clang 23 ou plus : '23' ou 'main' (= derniere, actuellement 23.0.0git)"
+        required: true
+        default: "main"
+      boot_url:
+        description: "URL du boot.img a patcher"
+        required: false
+        default: "https://download.pixelos.net/seventeen/sunny/recovery/boot-sunny_20261028_0537.img"
+
+permissions:
+  contents: read
+
+env:
+  ARCH: arm64
+  SUBARCH: arm64
+  DEFCONFIG: vendor/mojito_defconfig
+  CROSS_COMPILE: aarch64-linux-gnu-
+  CROSS_COMPILE_COMPAT: arm-linux-gnueabi-
+  CLANG_VER: ${{ inputs.clang_version || 'main' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Télécharger le source
+        uses: actions/checkout@v4
+        with:
+          ref: inline-rom
+          fetch-depth: 1
+          submodules: recursive
+
+      - name: Télécharger le boot.img
+        env:
+          BOOT_URL: ${{ inputs.boot_url }}
+        run: |
+          # Téléchargé AVANT le build : une URL morte échoue en 10 s au lieu de
+          # 40 min de compilation.
+          curl -fL --retry 3 --retry-delay 2 -o stock-boot.img "$BOOT_URL"
+          echo "taille    : $(stat -c%s stock-boot.img) octets"
+          test "$(head -c8 stock-boot.img)" = "ANDROID!" && echo "magic     : ANDROID!"
+
+      - name: Installer les dépendances
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison build-essential ccache coccinelle flex git libssl-dev \
+            libelf-dev pahole patch python3 rsync unzip wget zip jq \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            gcc-arm-linux-gnueabi binutils-arm-linux-gnueabi
+
+      - name: Installer ZyC Clang (ZyCromerZ/Clang)
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # ZyC Clang : toolchain LLVM complet (clang, lld, llvm-ar, ...) deja
+          # compile, distribue en archives tar.gz via les releases GitHub.
+          # Le depot publie un fichier Clang-<version>-link.txt qui pointe
+          # toujours vers la derniere archive de cette version majeure.
+          BASE="https://raw.githubusercontent.com/ZyCromerZ/Clang/main"
+          LINK="$BASE/Clang-${CLANG_VER}-link.txt"
+
+          # GitHub (raw.githubusercontent / CDN des releases) renvoie parfois
+          # des 503 : on retente, on reprend les telechargements interrompus
+          # (curl -C -) et on bascule sur l'API GitHub puis des miroirs si le
+          # CDN officiel reste indisponible.
+          fetch() {
+            local url="$1" out="$2" i rc
+            shift 2
+            for i in $(seq 1 6); do
+              curl -fsSL --retry 4 --retry-all-errors --retry-delay 5 \
+                --connect-timeout 30 "$@" -o "$out" "$url" && return 0
+              rc=$?
+              echo "Echec (code $rc) sur $url, tentative $i/6..."
+              sleep $((i * 5))
+            done
+            return 1
+          }
+
+          download() {
+            local url="$1" out="$2" i rc tries="${TRIES:-8}"
+            shift 2
+            for i in $(seq 1 "$tries"); do
+              curl -fL --retry 5 --retry-all-errors --retry-delay 5 \
+                --connect-timeout 30 --max-time 3600 \
+                -C - "$@" -o "$out" "$url" && return 0
+              rc=$?
+              # 22/33/416 : erreur HTTP, reprise non supportee ou fichier complet
+              if [ "$rc" -eq 22 ] || [ "$rc" -eq 33 ] || [ "$rc" -eq 416 ]; then
+                rm -f "$out"
+              fi
+              echo "Telechargement echoue (code $rc), tentative $i/$tries, pause $((i * 5))s..."
+              sleep $((i * 5))
+            done
+            return 1
+          }
+
+          # Telecharge puis verifie l'archive : seules les archives valides sont
+          # acceptees (un miroir peut renvoyer une page d'erreur en HTTP 200).
+          try_url() {
+            local url="$1" out="$2"
+            shift 2
+            rm -f "$out.part"
+            download "$url" "$out.part" "$@" || return 1
+            if tar -tzf "$out.part" > /dev/null 2>&1; then
+              mv "$out.part" "$out"
+              return 0
+            fi
+            echo "Archive invalide depuis $url, on essaie autre chose."
+            rm -f "$out.part"
+            return 1
+          }
+
+          if ! fetch "$LINK" /tmp/zyc-link.txt; then
+            echo "Pas de Clang-${CLANG_VER}-link.txt, repli sur 'main' (derniere version)"
+            fetch "$BASE/Clang-main-link.txt" /tmp/zyc-link.txt || {
+              echo "ERREUR: impossible de recuperer le lien ZyC Clang" >&2
+              exit 1
+            }
+          fi
+
+          URL="$(tr -d '\r\n' < /tmp/zyc-link.txt)"
+          test -n "$URL" || {
+            echo "ERREUR: URL ZyC Clang vide" >&2
+            exit 1
+          }
+
+          # Exigence : ZyC Clang 23 minimum. Les archives 14/15/16 sont refusees.
+          MAJOR="$(printf '%s' "$URL" | grep -oE 'Clang-[0-9]+' | head -n1 | tr -dc '0-9' || true)"
+          if [ -n "$MAJOR" ] && [ "$MAJOR" -lt 23 ]; then
+            echo "ERREUR: ZyC Clang $MAJOR < 23 (choisir '23' ou 'main')" >&2
+            exit 1
+          fi
+          echo "Telechargement de $URL"
+
+          mkdir -p "$GITHUB_WORKSPACE/clang"
+          OUT=/tmp/zyc-clang.tar.gz
+          GOT=0
+
+          # Metadonnees de la release : id de l'asset et sha256 officiel.
+          TAG="$(printf '%s' "$URL" | sed -E 's#.*/download/([^/]+)/.*#\1#')"
+          RELEASE_API="https://api.github.com/repos/ZyCromerZ/Clang/releases/tags/$TAG"
+          AUTH=()
+          if [ -n "${GITHUB_TOKEN:-}" ]; then
+            AUTH=(-H "Authorization: Bearer $GITHUB_TOKEN")
+          fi
+          ASSET_JSON="$(curl -fsSL -H 'Accept: application/vnd.github+json' "${AUTH[@]}" \
+            "$RELEASE_API" 2>/dev/null || true)"
+          ASSET_ID="$(printf '%s' "$ASSET_JSON" \
+            | jq -r '.assets[] | select(.name | endswith(".tar.gz")) | .id' 2>/dev/null \
+            | head -n1 || true)"
+          EXPECTED_SHA="$(printf '%s' "$ASSET_JSON" \
+            | jq -r '.assets[] | select(.name | endswith(".tar.gz")) | .digest' 2>/dev/null \
+            | head -n1 | sed 's/^sha256://' || true)"
+          case "$EXPECTED_SHA" in
+            [0-9a-f]*) ;;
+            *) EXPECTED_SHA="" ;;
+          esac
+
+          # 1) URL officielle de la release.
+          TRIES=4
+          if try_url "$URL" "$OUT"; then
+            GOT=1
+          fi
+
+          # 2) Endpoint API GitHub (different du CDN des releases).
+          if [ "$GOT" -eq 0 ] && [ -n "$ASSET_ID" ]; then
+            echo "Repli via l'API GitHub (asset $ASSET_ID)..."
+            TRIES=3
+            if try_url "https://api.github.com/repos/ZyCromerZ/Clang/releases/assets/$ASSET_ID" \
+                 "$OUT" -H 'Accept: application/octet-stream'; then
+              GOT=1
+            fi
+          fi
+
+          # 3) Miroirs publics GitHub si le CDN officiel renvoie encore des 5xx.
+          if [ "$GOT" -eq 0 ]; then
+            for MIRROR in "https://ghfast.top/" "https://ghproxy.net/" "https://gh-proxy.com/" "https://github.moeyy.xyz/"; do
+              echo "Repli via le miroir $MIRROR..."
+              TRIES=2
+              if try_url "${MIRROR}${URL}" "$OUT"; then
+                GOT=1
+                break
+              fi
+            done
+          fi
+
+          if [ "$GOT" -eq 0 ]; then
+            echo "ERREUR: telechargement ZyC Clang impossible (CDN, API et miroirs)" >&2
+            exit 1
+          fi
+
+          # Verifie l'integrite si GitHub a fourni un sha256.
+          if [ -n "$EXPECTED_SHA" ]; then
+            ACTUAL_SHA="$(sha256sum "$OUT" | awk '{print $1}')"
+            if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
+              echo "ERREUR: sha256 ZyC Clang invalide (attendu $EXPECTED_SHA, obtenu $ACTUAL_SHA)" >&2
+              exit 1
+            fi
+            echo "OK: sha256 ZyC Clang verifie"
+          fi
+
+          tar -xzf "$OUT" -C "$GITHUB_WORKSPACE/clang"
+          rm -f "$OUT"
+
+          # L'archive contient normalement bin/ a la racine. Si elle est
+          # emballee dans un unique sous-dossier, on remonte son contenu.
+          if [ ! -x "$GITHUB_WORKSPACE/clang/bin/clang" ]; then
+            ROOT="$(find "$GITHUB_WORKSPACE/clang" -mindepth 1 -maxdepth 1 -type d | head -n1)"
+            if [ -n "$ROOT" ] && [ -x "$ROOT/bin/clang" ]; then
+              shopt -s dotglob
+              mv "$ROOT"/* "$GITHUB_WORKSPACE/clang"/
+              rmdir "$ROOT"
+            fi
+          fi
+          test -x "$GITHUB_WORKSPACE/clang/bin/clang"
+
+          # Le Makefile (LLVM=1) appelle clang, llvm-ar, ld.lld... en dur :
+          # l'archive ZyC fournit deja tous ces noms sans suffixe.
+          # Persiste le PATH pour toutes les etapes suivantes (config + build).
+          echo "$GITHUB_WORKSPACE/clang/bin" >> "$GITHUB_PATH"
+          export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
+          clang --version
+          ld.lld --version
+          llvm-ar --version | head -n1
+          
+      - name: Télécharger et appliquer les patchs KernelSU et SuSFS
+        run: |
+          git clone --depth=1 -b main https://github.com/nanix06/Patch_Ksu_SuSFS.git patches
+          patch -p1 --fuzz=3 < patches/Patches/SU_kernel/patch_ksunext.patch || true
+          patch -p1 --fuzz=3 < patches/Patches/SuSFS_Kernel/50_add_susfs_in_kernel-4.14.patch || true
+          patch -p1 --fuzz=3 < patches/Patches/Fix/susfs_fix_statc.patch || true
+          patch -p1 --fuzz=3 < patches/Patches/SuSFS_Kernel/55_try_umount_for_susfs.patch || true
+          patch -p1 --fuzz=3 < patches/Patches/SU_kernel/patch_ksu_path_umount.patch || true
+          sed -i 's/inotify_mark_user_mask(mark)/(mark->mask \& IN_ALL_EVENTS)/g' fs/notify/fdinfo.c
+          sed -i '/^orig_flow:$/a\\t\t;' fs/notify/fdinfo.c
+          sed -i '0,/^static void susfs_run_sus_path_loop(void) {/s//void susfs_run_sus_path_loop(void) {/' fs/susfs.c
+
+      - name: Corriger l'injection initrc (hooks newfstat/fstat64 manquants)
+        run: |
+          # Patch fourni par le repo Patch_Ksu_SuSFS (clone dans patches/).
+          #
+          # Le patch kernelSU (nanix06) hooke newfstatat/fstatat64 -> ksu_handle_stat,
+          # mais oublie newfstat -> ksu_handle_newfstat_ret et fstat64 -> ksu_handle_fstat64_ret.
+          # Sans eux, init ne voit pas la taille reelle + accolee de init.rc, donc
+          # KERNEL_SU_RC / modules.rc ne sont jamais lus, ksud post-fs-data n'est jamais
+          # lance et les modules ne montent pas au boot.
+          FIX=patches/Patches/Fix/patch_ksu_initrc_newfstat.patch
+          test -f "$FIX" || {
+            echo "ERREUR: $FIX absent (repo Patch_Ksu_SuSFS incomplet)"
+            exit 1
+          }
+          # git apply (et non GNU patch) : le hunk fstat64 a 7 lignes de contexte avant
+          # et 2 apres, GNU patch le considere alors "ancre en fin de fichier" et le
+          # rejette ("Hunk #2 FAILED at 523"). git apply l'accepte avec le meme offset.
+          git apply --verbose "$FIX"
+
+          grep -q 'ksu_handle_newfstat_ret' fs/stat.c
+          grep -q 'ksu_handle_fstat64_ret' fs/stat.c
+          echo "OK: hooks newfstat/fstat64 presents dans fs/stat.c"   
+
+      - name: Ajouter KernelSU-Next
+        run: |
+          git clone --depth=1 -b legacy https://github.com/KernelSU-Next/KernelSU-Next.git KernelSU
+          ln -s ../KernelSU/kernel drivers/kernelsu
+          sed -i 's/get_monotonic_boottime(&ts)/get_monotonic_boottime64(\&ts)/' KernelSU/kernel/sulog/event.c
+          sed -i '/#include <linux\/uaccess.h>/a #include <linux/timekeeping.h>' KernelSU/kernel/sulog/event.c
+
+          bash patches/Patches/Fix/fix_sepolicy_mojito.sh KernelSU
+
+          # NB: pas de '#define KSU_TYPE_VAL_TO_STRUCT' ici. Ce noyau 4.14 utilise encore
+          # flex_array dans policydb/avtab (type_val_to_struct_array, type_attr_map_array,
+          # sym_val_to_name, htable). Ce define forcerait le chemin "noyau recent" de
+          # sepolicy.c et casserait la compilation (14 erreurs).
+          printf '%s\n' \
+            '#include "ss/avtab.h"' \
+            '#include "ss/constraint.h"' \
+            '#include "ss/ebitmap.h"' \
+            '#include "ss/hashtab.h"' \
+            '#include "ss/policydb.h"' \
+            '#include "ss/services.h"' \
+            '#include "ss/symtab.h"' \
+            '#include <linux/gfp.h>' \
+            '#include <linux/kernel.h>' \
+            '#include <linux/printk.h>' \
+            '#include <linux/slab.h>' \
+            '#include <linux/stddef.h>' \
+            '#include <linux/string.h>' \
+            '#include <linux/types.h>' \
+            '#include <linux/version.h>' \
+            '#include <linux/vmalloc.h>' \
+            | cat - KernelSU/kernel/selinux/sepolicy.c > /tmp/sepolicy.c.net \
+            && mv /tmp/sepolicy.c.net KernelSU/kernel/selinux/sepolicy.c
+
+          # KernelSU-Next legacy appelle ksu_policydb_fixup_len(), absent du sepolicy.c backslashxx
+          cat >> KernelSU/kernel/selinux/sepolicy.c <<'EOF'
+
+          int ksu_policydb_fixup_len(struct policydb *db, const char *tag)
+          {
+              return 0;
+          }
+          EOF
+
+          cp patches/Patches/SuSFS_Ksu/susfs_patch_ksunext.patch KernelSU/
+          cd KernelSU
+          patch -p1 < susfs_patch_ksunext.patch || true
+          cd ..
+
+      - name: Ajouter EROFS (depuis nanix06/Neternels_kernel_sunny)
+        run: |
+          set -euo pipefail
+
+          # EROFS repris du noyau sunny (4.14 CAF LA.UM.9.1) : fs/erofs complet
+          # (compression LZ4/pcluster, workers de decompression per-CPU) ainsi
+          # que son en-tete de trace. Le noyau mojito embarque deja un fs/erofs
+          # plus ancien (desactive dans le defconfig) : on le remplace, puis on
+          # recable fs/Kconfig et fs/Makefile de facon idempotente.
+          SRC_REPO="nanix06/Neternels_kernel_sunny"
+          SRC_REF="staging"
+          RAW="https://raw.githubusercontent.com/$SRC_REPO/$SRC_REF"
+          MIRROR="https://ghfast.top/$RAW"
+          CDN="https://cdn.jsdelivr.net/gh/$SRC_REPO@$SRC_REF"
+
+          fetch() {
+            local url="$1" out="$2" i
+            for i in 1 2 3 4 5; do
+              if curl -fsSL --retry 3 --retry-all-errors --retry-delay 3 \
+                   --connect-timeout 30 --max-time 180 -o "$out" "$url"; then
+                return 0
+              fi
+              echo "Echec ($url), tentative $i/5..."
+              sleep $((i * 3))
+            done
+            return 1
+          }
+
+          get() {   # get <chemin dans le depot> <destination>
+            local path="$1" dest="$2"
+            fetch "$RAW/$path" "$dest" \
+              || fetch "$MIRROR/$path" "$dest" \
+              || fetch "$CDN/$path" "$dest" || {
+                echo "ERREUR: impossible de recuperer $path" >&2
+                exit 1
+              }
+            test -s "$dest" || {
+              echo "ERREUR: $path vide" >&2
+              exit 1
+            }
+          }
+
+          EROFS_FILES="Kconfig Makefile TODO compress.h data.c decompressor.c \
+            dir.c erofs_fs.h inode.c internal.h namei.c pcpubuf.c super.c \
+            tagptr.h utils.c xattr.c xattr.h zdata.c zdata.h zmap.c zpvec.h"
+
+          rm -rf fs/erofs
+          mkdir -p fs/erofs
+          for f in $EROFS_FILES; do
+            get "fs/erofs/$f" "fs/erofs/$f"
+          done
+          get "include/trace/events/erofs.h" "include/trace/events/erofs.h"
+
+          # Garde-fous : les fichiers cles doivent contenir le code attendu et
+          # non une page d'erreur renvoyee en HTTP 200 par un miroir.
+          grep -q '^config EROFS_FS$' fs/erofs/Kconfig
+          grep -q 'z_erofs' fs/erofs/zdata.c
+          grep -q 'erofs_read_superblock' fs/erofs/super.c
+
+          # Cablage kbuild (deja present sur ce noyau, rendu idempotent).
+          if ! grep -q 'source "fs/erofs/Kconfig"' fs/Kconfig; then
+            if grep -q '^endif # MISC_FILESYSTEMS$' fs/Kconfig; then
+              sed -i '/^endif # MISC_FILESYSTEMS$/i source "fs/erofs/Kconfig"' fs/Kconfig
+            else
+              printf '\nsource "fs/erofs/Kconfig"\n' >> fs/Kconfig
+            fi
+          fi
+          grep -q 'CONFIG_EROFS_FS' fs/Makefile || \
+            printf 'obj-$(CONFIG_EROFS_FS)\t\t+= erofs/\n' >> fs/Makefile
+
+          grep -q 'source "fs/erofs/Kconfig"' fs/Kconfig
+          grep -q 'CONFIG_EROFS_FS' fs/Makefile
+          echo "OK: fs/erofs ($(ls fs/erofs | wc -l) fichiers) + trace header integres"
+
+      - name: Configurer le noyau
+        run: |
+          export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
+
+          mkdir -p out
+
+          make O=out ARCH=arm64 \
+            CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE="$CROSS_COMPILE" \
+            CROSS_COMPILE_COMPAT="$CROSS_COMPILE_COMPAT" \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            "$DEFCONFIG"
+
+          # KernelSU
+          ./scripts/config --file out/.config --enable KSU
+          ./scripts/config --file out/.config --disable KSU_KPROBES_KSUD
+          ./scripts/config --file out/.config --enable CONFIG_KALLSYMS_ALL
+
+          # SUSFS
+          ./scripts/config --file out/.config --enable KSU_SUSFS
+          ./scripts/config --file out/.config --enable KSU_SUSFS_HAS_MAGIC_MOUNT
+          ./scripts/config --file out/.config --enable KSU_SUSFS_SUS_PATH
+          ./scripts/config --file out/.config --disable KSU_SUSFS_SUS_MOUNT
+          ./scripts/config --file out/.config --enable KSU_SUSFS_SUS_KSTAT
+          ./scripts/config --file out/.config --enable KSU_SUSFS_SUS_OVERLAYFS
+          ./scripts/config --file out/.config --enable KSU_SUSFS_TRY_UMOUNT
+          ./scripts/config --file out/.config --enable KSU_SUSFS_SPOOF_UNAME_RELEASE
+
+          ./scripts/config --file out/.config \
+            --set-str LOCALVERSION "-STRIX-HOPE"
+
+          # EROFS (version reprise du noyau sunny)
+          ./scripts/config --file out/.config --enable EROFS_FS
+          ./scripts/config --file out/.config --disable EROFS_FS_DEBUG
+          ./scripts/config --file out/.config --enable EROFS_FS_XATTR
+          ./scripts/config --file out/.config --enable EROFS_FS_POSIX_ACL
+          ./scripts/config --file out/.config --enable EROFS_FS_SECURITY
+          ./scripts/config --file out/.config --enable EROFS_FS_ZIP
+          ./scripts/config --file out/.config --enable EROFS_FS_PCPU_KTHREAD
+          ./scripts/config --file out/.config --enable EROFS_FS_PCPU_KTHREAD_HIPRI
+
+          make O=out ARCH=arm64 \
+            CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE="$CROSS_COMPILE" \
+            CROSS_COMPILE_COMPAT="$CROSS_COMPILE_COMPAT" \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            olddefconfig
+
+          # EROFS doit survivre a olddefconfig.
+          grep -q '^CONFIG_EROFS_FS=y' out/.config
+          grep -q '^CONFIG_EROFS_FS_ZIP=y' out/.config
+          grep -q '^CONFIG_EROFS_FS_PCPU_KTHREAD=y' out/.config
+          echo "OK: EROFS actif dans out/.config"
+
+      - name: Compiler le noyau
+        run: |
+          make -j"$(nproc)" O=out ARCH=arm64 \
+            CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE="$CROSS_COMPILE" \
+            CROSS_COMPILE_COMPAT="$CROSS_COMPILE_COMPAT" \
+            LLVM=1 \
+            LLVM_IAS=1
+
+      - name: Préparer les fichiers
+        run: |
+          mkdir -p release
+          cp out/arch/arm64/boot/Image.gz release/ 2>/dev/null || true
+          cp out/arch/arm64/boot/Image.gz-dtb release/ 2>/dev/null || true
+          cp out/arch/arm64/boot/Image release/ 2>/dev/null || true
+          sha256sum release/* > release/SHA256SUMS
+
+      - name: Générer le boot.img patché
+        env:
+          BOOT_URL: ${{ inputs.boot_url }}
+        run: |
+          test -f out/arch/arm64/boot/Image || { echo "ERREUR: out/arch/arm64/boot/Image absent"; exit 1; }
+          grep -aq 'KernelSU' out/arch/arm64/boot/Image || { echo "ERREUR: KernelSU absent du noyau compile"; exit 1; }
+
+          BOOT_OUT=release/boot-mojito-KSU-STRIX.img
+
+          # Repack du boot stock : on garde header, ramdisk, cmdline et
+          # os_version de la ROM, on ne remplace QUE la section kernel.
+          # Ce boot est en header v4 (1584 o, page 4096) avec une Image arm64
+          # NON compressee et aucun DTB dedans (le DTB est dans vendor_boot,
+          # qui n'est pas touche).
+          python3 - stock-boot.img out/arch/arm64/boot/Image "$BOOT_OUT" <<'PY'
+          import hashlib, struct, sys
+
+          src, kpath, dst = sys.argv[1], sys.argv[2], sys.argv[3]
+          PAGE = 4096
+
+          def align(n):
+              return (n + PAGE - 1) // PAGE * PAGE
+
+          img = open(src, "rb").read()
+          if img[:8] != b"ANDROID!":
+              sys.exit("boot stock: magic ANDROID! absent")
+
+          hv  = struct.unpack_from("<I", img, 40)[0]
+          hsz = struct.unpack_from("<I", img, 20)[0]
+          ks  = struct.unpack_from("<I", img, 8)[0]
+          rs  = struct.unpack_from("<I", img, 12)[0]
+          osv = struct.unpack_from("<I", img, 16)[0]
+
+          if hv not in (3, 4):
+              sys.exit("header_version %d non gere (attendu 3 ou 4)" % hv)
+
+          ram_off = PAGE + align(ks)
+          if ram_off + rs > len(img):
+              sys.exit("ramdisk hors image: header incoherent")
+
+          ramdisk = img[ram_off:ram_off + rs]
+          kern = open(kpath, "rb").read()
+
+          if img[PAGE + 0x38:PAGE + 0x3C] != b"ARM\x64":
+              print("ATTENTION: le noyau stock n'est pas une Image arm64")
+          if kern[0x38:0x3C] != b"ARM\x64":
+              sys.exit("le noyau fourni n'est pas une Image arm64")
+
+          hdr = bytearray(img[:PAGE])
+          struct.pack_into("<I", hdr, 8, len(kern))        # kernel_size
+          struct.pack_into("<I", hdr, 12, len(ramdisk))    # ramdisk_size
+          if hv == 4:
+              struct.pack_into("<I", hdr, 1580, 0)         # signature_size = 0
+
+          new_ram_off = PAGE + align(len(kern))
+          out = bytes(hdr) + kern + b"\0" * (new_ram_off - PAGE - len(kern))
+          out += ramdisk + b"\0" * (align(len(ramdisk)) - len(ramdisk))
+          open(dst, "wb").write(out)
+
+          # relecture pour verifier que rien n'a bouge a part le noyau
+          chk = open(dst, "rb").read()
+          nks = struct.unpack_from("<I", chk, 8)[0]
+          nrs = struct.unpack_from("<I", chk, 12)[0]
+          nro = PAGE + align(nks)
+          assert chk[:8] == b"ANDROID!" and chk[PAGE:PAGE + nks] == kern
+          assert chk[nro:nro + nrs] == ramdisk and len(chk) % PAGE == 0
+          assert chk[16:20] == img[16:20] and chk[44:1580] == img[44:1580]
+
+          print("header   : v%d (header_size=%d)  os_version=0x%08x" % (hv, hsz, osv))
+          print("noyau    : %d o (stock %d o)" % (len(kern), ks))
+          print("ramdisk  : %d o a l'offset 0x%x (inchange)" % (nrs, nro))
+          print("image    : %d o (%.2f MiB)" % (len(chk), len(chk) / 1048576.0))
+          print("sha256   : " + hashlib.sha256(chk).hexdigest())
+          print("OK: ramdisk / cmdline / os_version identiques au stock")
+          PY
+
+          cd release
+          sha256sum $(ls -1 | grep -v '^SHA256SUMS$') > SHA256SUMS
+          cat SHA256SUMS
+
+          {
+            echo "### boot.img patché"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| ROM source | $BOOT_URL |"
+            echo "| fichier | \`boot-mojito-KSU-STRIX.img\` |"
+            echo "| taille | $(stat -c%s boot-mojito-KSU-STRIX.img) octets |"
+            echo "| sha256 | \`$(sha256sum boot-mojito-KSU-STRIX.img | cut -d' ' -f1)\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Envoyer l’artefact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Mojito-STRIX-KernelSU
+          path: release/
+          if-no-files-found: error
