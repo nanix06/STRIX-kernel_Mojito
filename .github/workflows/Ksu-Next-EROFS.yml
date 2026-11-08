@@ -557,6 +557,6 @@ jobs:
       - name: Envoyer l’artefact
         uses: actions/upload-artifact@v4
         with:
-          name: Mojito-STRIX-KernelSU
+          name: Mojito-STRIX-KernelSU-EROFS
           path: release/
           if-no-files-found: error
