@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       clang_version:
-        description: "Version de clang/LLVM (ex: 21, 22, 23)"
+        description: "ZyC Clang 23 ou plus : '23' ou 'main' (= derniere, actuellement 23.0.0git)"
         required: true
-        default: "23"
+        default: "main"
 
 permissions:
   contents: read
@@ -17,7 +17,7 @@ env:
   DEFCONFIG: vendor/mojito_defconfig
   CROSS_COMPILE: aarch64-linux-gnu-
   CROSS_COMPILE_COMPAT: arm-linux-gnueabi-
-  CLANG_VER: ${{ inputs.clang_version || '23' }}
+  CLANG_VER: ${{ inputs.clang_version || 'main' }}
 
 jobs:
   build:
@@ -38,22 +38,58 @@ jobs:
             bc bison build-essential ccache coccinelle flex git libssl-dev \
             libelf-dev pahole patch python3 rsync unzip wget zip \
             gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
-            gcc-arm-linux-gnueabi binutils-arm-linux-gnueabi \
-            lsb-release software-properties-common gnupg
+            gcc-arm-linux-gnueabi binutils-arm-linux-gnueabi
 
-      - name: Installer clang (apt.llvm.org)
+      - name: Installer ZyC Clang (ZyCromerZ/Clang)
         run: |
-          wget -q https://apt.llvm.org/llvm.sh
-          chmod +x llvm.sh
-          sudo ./llvm.sh "$CLANG_VER" all
-          sudo apt-get install -y "lld-$CLANG_VER" "llvm-$CLANG_VER"
+          set -euo pipefail
 
-          # Liens sans suffixe : le Makefile du kernel (LLVM=1) appelle "clang", "llvm-ar", etc. en dur
-          for t in clang clang++ clang-cpp ld.lld lld llvm-ar llvm-nm llvm-objcopy \
-                   llvm-objdump llvm-readelf llvm-strip llvm-ranlib llvm-as llvm-size; do
-            [ -x "/usr/lib/llvm-$CLANG_VER/bin/$t" ] && \
-              sudo ln -sf "/usr/lib/llvm-$CLANG_VER/bin/$t" "/usr/local/bin/$t"
-          done
+          # ZyC Clang : toolchain LLVM complet (clang, lld, llvm-ar, ...) deja
+          # compile, distribue en archives tar.gz via les releases GitHub.
+          # Le depot publie un fichier Clang-<version>-link.txt qui pointe
+          # toujours vers la derniere archive de cette version majeure.
+          BASE="https://raw.githubusercontent.com/ZyCromerZ/Clang/main"
+          LINK="$BASE/Clang-${CLANG_VER}-link.txt"
+
+          if ! curl -fsSL "$LINK" -o /tmp/zyc-link.txt; then
+            echo "Pas de Clang-${CLANG_VER}-link.txt, repli sur 'main' (derniere version)"
+            curl -fsSL "$BASE/Clang-main-link.txt" -o /tmp/zyc-link.txt
+          fi
+
+          URL="$(tr -d '\r\n' < /tmp/zyc-link.txt)"
+          test -n "$URL" || {
+            echo "ERREUR: URL ZyC Clang vide" >&2
+            exit 1
+          }
+
+          # Exigence : ZyC Clang 23 minimum. Les archives 14/15/16 sont refusees.
+          MAJOR="$(printf '%s' "$URL" | grep -oE 'Clang-[0-9]+' | head -n1 | tr -dc '0-9' || true)"
+          if [ -n "$MAJOR" ] && [ "$MAJOR" -lt 23 ]; then
+            echo "ERREUR: ZyC Clang $MAJOR < 23 (choisir '23' ou 'main')" >&2
+            exit 1
+          fi
+          echo "Telechargement de $URL"
+
+          mkdir -p "$GITHUB_WORKSPACE/clang"
+          curl -fSL --retry 3 --retry-delay 5 -o /tmp/zyc-clang.tar.gz "$URL"
+          tar -xzf /tmp/zyc-clang.tar.gz -C "$GITHUB_WORKSPACE/clang"
+          rm -f /tmp/zyc-clang.tar.gz
+
+          # L'archive contient normalement bin/ a la racine. Si elle est
+          # emballee dans un unique sous-dossier, on remonte son contenu.
+          if [ ! -x "$GITHUB_WORKSPACE/clang/bin/clang" ]; then
+            ROOT="$(find "$GITHUB_WORKSPACE/clang" -mindepth 1 -maxdepth 1 -type d | head -n1)"
+            if [ -n "$ROOT" ] && [ -x "$ROOT/bin/clang" ]; then
+              shopt -s dotglob
+              mv "$ROOT"/* "$GITHUB_WORKSPACE/clang"/
+              rmdir "$ROOT"
+            fi
+          fi
+          test -x "$GITHUB_WORKSPACE/clang/bin/clang"
+
+          # Le Makefile (LLVM=1) appelle clang, llvm-ar, ld.lld... en dur :
+          # l'archive ZyC fournit deja tous ces noms sans suffixe.
+          export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
           clang --version
           ld.lld --version
           llvm-ar --version | head -n1
@@ -141,14 +177,21 @@ jobs:
           cd ..
 
       - name: Appliquer le commit mojito_defconfig (localversion STRIX-HOPE)
-        run: |  
+        run: |
+          # Commit 6bd76607aca6f77a0257e04ef4d6cea10d4b8928
+          # (romgharti/kernel_xiaomi_mojito) :
+          #   arch/arm64/configs/vendor/mojito_defconfig
+          #   CONFIG_LOCALVERSION="-STRIX-BLISS" -> CONFIG_LOCALVERSION="-STRIX-HOPE"
+          #
+          # Applique via sed plutot que "git apply" : la branche inline-rom peut
+          # avoir un contexte different, et seule la valeur nous interesse.
           DEF="arch/arm64/configs/$DEFCONFIG"
           test -f "$DEF" || {
             echo "ERREUR: $DEF introuvable" >&2
             exit 1
           }
           if grep -q '^CONFIG_LOCALVERSION=' "$DEF"; then
-          sed -i 's/^CONFIG_LOCALVERSION=.*/CONFIG_LOCALVERSION="-STRIX-HOPE"/' "$DEF"
+            sed -i 's/^CONFIG_LOCALVERSION=.*/CONFIG_LOCALVERSION="-STRIX-HOPE"/' "$DEF"
           else
             sed -i '/^# CONFIG_LOCALVERSION is not set$/d' "$DEF"
             printf '\nCONFIG_LOCALVERSION="-STRIX-HOPE"\n' >> "$DEF"
