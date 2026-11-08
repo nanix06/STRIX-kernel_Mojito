@@ -299,29 +299,6 @@ jobs:
           patch -p1 < susfs_patch_ksunext.patch || true
           cd ..
 
-      - name: Appliquer le commit mojito_defconfig (localversion STRIX-HOPE)
-        run: |
-          # Commit 6bd76607aca6f77a0257e04ef4d6cea10d4b8928
-          # (romgharti/kernel_xiaomi_mojito) :
-          #   arch/arm64/configs/vendor/mojito_defconfig
-          #   CONFIG_LOCALVERSION="-STRIX-BLISS" -> CONFIG_LOCALVERSION="-STRIX-HOPE"
-          #
-          # Applique via sed plutot que "git apply" : la branche inline-rom peut
-          # avoir un contexte different, et seule la valeur nous interesse.
-          DEF="arch/arm64/configs/$DEFCONFIG"
-          test -f "$DEF" || {
-            echo "ERREUR: $DEF introuvable" >&2
-            exit 1
-          }
-          if grep -q '^CONFIG_LOCALVERSION=' "$DEF"; then
-            sed -i 's/^CONFIG_LOCALVERSION=.*/CONFIG_LOCALVERSION="-STRIX-HOPE"/' "$DEF"
-          else
-            sed -i '/^# CONFIG_LOCALVERSION is not set$/d' "$DEF"
-            printf '\nCONFIG_LOCALVERSION="-STRIX-HOPE"\n' >> "$DEF"
-          fi
-          grep -q '^CONFIG_LOCALVERSION="-STRIX-HOPE"$' "$DEF"
-          echo "OK: localversion STRIX-HOPE applique dans $DEF"
-
       - name: Configurer le noyau
         run: |
           export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
@@ -354,7 +331,6 @@ jobs:
 
           ./scripts/config --file out/.config \
             --set-str LOCALVERSION "-STRIX-HOPE"
-          ./scripts/config --file out/.config --disable CONFIG_LOCALVERSION_AUTO
 
           make O=out ARCH=arm64 \
             CC=clang \
